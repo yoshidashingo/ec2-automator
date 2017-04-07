@@ -1,101 +1,294 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
 import boto3
-import collections
+import json
+from boto3.session import Session
 import time
-from botocore.client import ClientError
-ec2 = boto3.client('ec2')
+from datetime import datetime as dt
 
+import pprint
+
+TAG_KEY_AUTO_BACKUP       = 'AmiBackup'
+TAG_VAL_AUTO_BACKUP       = 'ON'
+TAG_KEY_BACKUP_GENERATION = 'AmiGeneration'
+
+print('Loading function')
+
+pp = pprint.PrettyPrinter(indent=4)
+
+# 関数名 ： lambda_handler
 def lambda_handler(event, context):
-    descriptions = create_snapshots()
-    delete_old_snapshots(descriptions)
+    print("Received event: " + json.dumps(event, indent=2))
 
-def create_snapshots():
-    instances = get_instances(['EbsGeneration'])
+    ec2_client   = boto3.client('ec2')
+    ec2_resource = boto3.resource('ec2')
 
-    descriptions = {}
+    ret = execute_ami_backup_task(ec2_client, ec2_resource)
+    print 'AMI buckup task is completed(%s).' % (ret)
 
-    for i in instances:
-        tags = { t['Key']: t['Value'] for t in i['Tags'] }
-        generation = int( tags.get('EbsGeneration', 0) )
+    return 0
+    raise Exception('Something went wrong')
 
-        if generation < 1:
-            continue
 
-        for b in i['BlockDeviceMappings']:
-            if b.get('Ebs') is None:
+# 関数名 ： execute_ami_backup_task
+# 戻り値 ： 実行結果
+# 引数　 ： ec2_client
+#       ： ec2_resource
+# 機能　 ： AMIバックアップを実行する
+def execute_ami_backup_task(ec2_client, ec2_resource):
+    response = ec2_client.describe_instances()
+
+    exec_time = dt.now().strftime('%Y%m%d%H%M%S')
+
+    result = True
+    for ec2_group in response['Reservations']:
+        for instance_info in ec2_group['Instances']:
+            ret = is_target(instance_info)
+            if (ret == False):
                 continue
 
-            volume_id = b['Ebs']['VolumeId']
-            description = volume_id if tags.get('Name') is '' else '%s(%s)' % (volume_id, tags['Name'])
-            description = 'Auto Snapshot: ' + tags.get('EbsPrefix') + ': ' + description
+            ret = create_buckup_image(ec2_client, ec2_resource, instance_info, exec_time)
+            if not ret:
+                print 'create_buckup_image(%s) was failed.' % (instance_info['InstanceId'])
+                result = False
 
-            snapshot = _create_snapshot(volume_id, description)
-            print 'create snapshot %s(%s)' % (snapshot['SnapshotId'], description)
+                continue
 
-            descriptions[description] = generation
+            ret = delete_old_image(ec2_client, ec2_resource, instance_info)
+            if not ret:
+                print 'delete_old_image(%s) was failed.' % (instance_info['InstanceId'])
+                result = False
 
-    return descriptions
+                continue
 
-def get_instances(tag_names):
-    reservations = ec2.describe_instances(
-        Filters=[
-            {
-                'Name': 'tag-key',
-                'Values': tag_names
-            }
-        ]
-    )['Reservations']
+    return result
 
-    return sum([
-        [i for i in r['Instances']]
-        for r in reservations
-    ], [])
 
-def delete_old_snapshots(descriptions):
-    snapshots_descriptions = get_snapshots_descriptions(descriptions.keys())
+# 関数名 ： is_target
+# 戻り値 ： バックアップ要否
+# 引数　 ： instance_info <dict>
+# 機能　 ： バックアップ要否を判定する
+def is_target(instance_info):
+    val = get_tag_value(
+        instance_info, 
+        TAG_KEY_BACKUP_GENERATION
+    )
 
-    for description, snapshots in snapshots_descriptions.items():
-        delete_count = len(snapshots) - descriptions[description]
+    if val is None:
+        return False
 
-        if delete_count <= 0:
+    return True
+
+
+# 関数名 ： get_tag_value
+# 戻り値 ： タグ値（当該キーに合致するものがなければNone）
+# 引数　 ： instance_info <dict>
+#       ： key <str>
+# 機能　 ： インスタンス情報から指定キーのタグ値を取得する
+def get_tag_value(instance_info, key):
+    tags = instance_info['Tags']
+    for tag in tags:
+        if not (key == tag['Key']):
             continue
 
-        snapshots.sort(key=lambda x:x['StartTime'])
+        return tag['Value']
 
-        old_snapshots = snapshots[0:delete_count]
+    return None
 
-        for s in old_snapshots:
-            _delete_snapshot(s['SnapshotId'])
-            print 'delete snapshot %s(%s)' % (s['SnapshotId'], s['Description']) 
 
-def get_snapshots_descriptions(descriptions):
-    snapshots = ec2.describe_snapshots(
-        Filters=[
-            {
-                'Name': 'description',
-                'Values': descriptions,
-            }
-        ]
-    )['Snapshots']
+# 関数名 ： create_buckup_image
+# 戻り値 ： 実行結果
+# 引数　 ： ec2_client
+#       ： ec2_resource
+#       ： instance_info <dict>
+#       ： exec_time <str>
+# 機能　 ： バックアップイメージを作成する
+def create_buckup_image(ec2_client, ec2_resource, instance_info, exec_time):
+    inst_id = instance_info['InstanceId']
+    name    = get_tag_value(instance_info, 'Name')
+    if name is None:
+        print('Get name error!!')
 
-    groups = collections.defaultdict(lambda: [])
-    { groups[ s['Description'] ].append(s) for s in snapshots }
+        return False
 
-    return groups
+    image_name = name + '-' + exec_time
 
-def _create_snapshot(id, description):
-    for i in range(1, 3):
-        try:
-            return ec2.create_snapshot(VolumeId=id,Description=description)
-        except ClientError as e:
-            print str(e)
-        time.sleep(1)
-    raise Exception('cannot create snapshot ' + description)
+    response = ec2_client.create_image(
+        InstanceId  = inst_id,
+        Name        = image_name,
+        Description = image_name,
+        NoReboot    = True
+    )
 
-def _delete_snapshot(id):
-    for i in range(1, 3):
-        try:
-            return ec2.delete_snapshot(SnapshotId=id)
-        except ClientError as e:
-            print str(e)
-        time.sleep(1)
-    raise Exception('cannot delete snapshot ' + id)
+    image_id = response['ImageId']
+    print '%s was created.' % (image_id)
+
+    # 念のため、タグ設定対象のイメージ＆スナップショットが出来上がるまで待つ
+    time.sleep(10)
+
+    tags  = construct_backup_tags(instance_info)
+    image = ec2_resource.Image(image_id)
+
+    set_tags_to_image(image, tags)
+
+    set_tags_to_snapshot(ec2_resource, image, tags, image_name)
+
+    return True
+
+
+# 関数名 ： construct_backup_tags
+# 戻り値 ： タグ群
+# 引数　 ： instance_info <dict>
+# 機能　 ： バックアプ設定用のタグ群を構成する
+def construct_backup_tags(instance_info):
+    ret_tags = []
+    tags = instance_info['Tags']
+    for tag in tags:
+        if (TAG_KEY_BACKUP_GENERATION == tag['Key']):
+            continue
+
+        ret_tags.append(tag)
+
+    t = {u'Value': TAG_VAL_AUTO_BACKUP, u'Key': TAG_KEY_AUTO_BACKUP}
+    ret_tags.append(t)
+
+    return ret_tags
+
+
+# 関数名 ： set_tags_to_image
+# 戻り値 ： non
+# 引数　 ： image
+#       ： tags <list>
+# 機能　 ： AMIイメージにタグ情報を設定する
+def set_tags_to_image(image, tags):
+    image.create_tags(Tags = tags)
+
+    return
+
+
+# 関数名 ： set_tags_to_snapshot
+# 戻り値 ： non
+# 引数　 ： ec2_resource
+#       ： image
+#       ： tags <list>
+#       ： image_name <str>
+# 機能　 ： スナップショットにタグ情報を設定する
+def set_tags_to_snapshot(ec2_resource, image, tags, image_name):
+    for dev in image.block_device_mappings:
+        # EBS以外は対象外
+        if not dev.has_key('Ebs'):
+            continue
+
+        # Nameタグ差し替えのため、一旦削除
+        name_idx = get_name_tag_index(tags)
+        tags.pop(name_idx)
+
+        # Nameタグ設定
+        dev_name = dev['DeviceName'][5:]
+        name = image_name + '-' + dev_name
+        t = {u'Value': name, u'Key': 'Name'}
+        tags.append(t)
+
+        snapshot_id = dev['Ebs']['SnapshotId']
+        snapshot = ec2_resource.Snapshot(snapshot_id)
+
+        snapshot.create_tags(Tags = tags)
+
+    return
+
+
+# 関数名 ： get_name_tag_index
+# 戻り値 ： Nameタグのインデックス位置（当該キーに合致するものがなければNone）
+# 引数　 ： tags <list>
+# 機能　 ： タグリストの中でNameタグのインデックス位置を取得する
+def get_name_tag_index(tags):
+    idx = 0
+    for tag in tags:
+        if tag['Key'] == 'Name':
+            return idx
+
+        idx += 1
+
+    return None
+
+
+# 関数名 ： delete_old_image
+# 戻り値 ： 実行結果
+# 引数　 ： ec2_client
+#       ： ec2_resource
+#       ： instance_info <dict>
+# 機能　 ： 保持世代よりも古いイメージを削除する
+def delete_old_image(ec2_client, ec2_resource, instance_info):
+    sorted_images = get_sorted_images(ec2_client, instance_info)
+
+    generation = int(get_tag_value(instance_info, TAG_KEY_BACKUP_GENERATION))
+    cnt = 0
+    for img in sorted_images:
+        cnt += 1
+        if generation >= cnt:
+            continue
+
+        image_id  = img['ImageId']
+        snapshots = get_snapshots(ec2_resource, image_id)
+
+        # AMIイメージを解放する
+        ec2_client.deregister_image(
+            ImageId = image_id
+        )
+        print '%s was deregistered.' % (image_id)
+
+        # 解放完了まで待つ
+        time.sleep(10)
+
+        # 対応するスナップショットを削除する
+        for snapshot in snapshots:
+            snapshot.delete()
+            print '%s was deleted.' % (snapshot)
+
+    return True
+
+
+# 関数名 ： get_sorted_images
+# 戻り値 ： ソート済みイメージ <list>
+# 引数　 ： ec2_client
+#       ： instance_info <dict>
+# 機能　 ： 作成順でソートしたAMIイメージリストを取得する
+def get_sorted_images(ec2_client, instance_info):
+    sorted_images = []
+    name     = get_tag_value(instance_info, 'Name')
+    response = ec2_client.describe_images(
+        Owners  = ['self'],
+        Filters = [{'Name': 'tag:Name',                   'Values': [name]},
+                   {'Name': 'tag:' + TAG_KEY_AUTO_BACKUP, 'Values': [TAG_VAL_AUTO_BACKUP]}]
+    )
+
+    images = response['Images']
+    sorted_images = sorted(
+        images, 
+        key = lambda x: x['CreationDate'], 
+        reverse = True
+    )
+
+    return sorted_images
+
+
+# 関数名 ： get_snapshots
+# 戻り値 ： スナップショット群 <list>
+# 引数　 ： ec2_resource
+#       ： image_id <str>
+# 機能　 ： AMIイメージに包含されるスナップショット群を取得する
+def get_snapshots(ec2_resource, image_id):
+    snapshots = []
+    image     = ec2_resource.Image(image_id)
+
+    for dev in image.block_device_mappings:
+        if not dev.has_key('Ebs'):
+            continue
+
+        snapshot_id = dev['Ebs']['SnapshotId']
+        snapshot    = ec2_resource.Snapshot(snapshot_id)
+
+        snapshots.append(snapshot)
+
+    return snapshots
