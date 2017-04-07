@@ -26,7 +26,7 @@ def create_snapshots():
 
             volume_id = b['Ebs']['VolumeId']
             description = volume_id if tags.get('Name') is '' else '%s(%s)' % (volume_id, tags['Name'])
-            description = 'Auto Snapshot ' + description
+            description = 'Auto Snapshot: ' + tags.get('EbsPrefix') + ': ' + description
 
             snapshot = _create_snapshot(volume_id, description)
             print 'create snapshot %s(%s)' % (snapshot['SnapshotId'], description)
