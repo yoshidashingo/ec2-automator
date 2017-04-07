@@ -9,13 +9,13 @@ def lambda_handler(event, context):
     delete_old_snapshots(descriptions)
 
 def create_snapshots():
-    instances = get_instances(['Backup-Generation'])
+    instances = get_instances(['EbsGeneration'])
 
     descriptions = {}
 
     for i in instances:
         tags = { t['Key']: t['Value'] for t in i['Tags'] }
-        generation = int( tags.get('Backup-Generation', 0) )
+        generation = int( tags.get('EbsGeneration', 0) )
 
         if generation < 1:
             continue
