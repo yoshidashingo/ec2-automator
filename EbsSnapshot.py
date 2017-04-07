@@ -9,7 +9,7 @@ def lambda_handler(event, context):
     delete_old_snapshots(descriptions)
 
 def create_snapshots():
-    instances = get_instances(['EbsGeneration'])
+    instances = get_instances(['EbsBackup'])
 
     descriptions = {}
 

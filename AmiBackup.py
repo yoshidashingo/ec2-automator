@@ -5,17 +5,17 @@ from botocore.client import ClientError
 ec2 = boto3.client('ec2')
 
 def lambda_handler(event, context):
-    descriptions = create_amibackups()
+    descriptions = create_snapshots()
     delete_old_snapshots(descriptions)
 
-def create_amibackups():
-    instances = get_instances(['AmiBackup'])
+def create_snapshots():
+    instances = get_instances(['EbsGeneration'])
 
     descriptions = {}
 
     for i in instances:
         tags = { t['Key']: t['Value'] for t in i['Tags'] }
-        generation = int( tags.get('BackupGeneration', 0) )
+        generation = int( tags.get('EbsGeneration', 0) )
 
         if generation < 1:
             continue
@@ -26,7 +26,7 @@ def create_amibackups():
 
             volume_id = b['Ebs']['VolumeId']
             description = volume_id if tags.get('Name') is '' else '%s(%s)' % (volume_id, tags['Name'])
-            description = 'Auto Snapshot ' + description
+            description = 'Auto Snapshot: ' + tags.get('EbsPrefix') + ': ' + description
 
             snapshot = _create_snapshot(volume_id, description)
             print 'create snapshot %s(%s)' % (snapshot['SnapshotId'], description)
@@ -89,7 +89,7 @@ def _create_snapshot(id, description):
         except ClientError as e:
             print str(e)
         time.sleep(1)
-    raise Exception('cannot create AMI ' + description)
+    raise Exception('cannot create snapshot ' + description)
 
 def _delete_snapshot(id):
     for i in range(1, 3):
